@@ -1,0 +1,71 @@
+# Define the services (containers) that make up the application.
+services:
+  # -- Database for the Inventory Service --
+  inventory-database:
+    image: postgres:15 # Use the official PostgreSQL 15 image.
+    environment:
+      # Set credentials for the PostgreSQL database.
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: inventory_database
+    ports:
+      # Map host port 5432 to container port 5432 for direct DB access if needed.
+      - "5432:5432"
+
+  # -- Database for the Payment Service --
+  payment-database:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: payment_database
+    ports:
+      # Map host port 5433 to container port 5432 to avoid port conflicts on the host.
+      - "5433:5432"
+
+  # -- Database for the Order Service --
+  order-database:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: order_database
+    ports:
+      # Map host port 5434 to container port 5432.
+      - "5434:5432"
+
+  # -- The Inventory Application Service --
+  inventory_service:
+    build: ./inventory_service # Build the image from the Dockerfile in the ./inventory_service directory.
+    depends_on: [inventory-database] # Ensures this service starts after its database dependency.
+    environment:
+      # Provide the database connection URL as an environment variable.
+      # 'inventory-database' is the hostname resolved by Docker's internal network.
+      DATABASE_URL: postgresql://user:pass@inventory-database:5432/inventory_database
+    ports:
+      # Map host port 8002 to the container's internal port 8000.
+      - "8002:8000"
+
+  # -- The Payment Application Service --
+  payment_service:
+    build: ./payment_service
+    depends_on: [payment-database]
+    environment:
+      DATABASE_URL: postgresql://user:pass@payment-database:5432/payment_database
+    ports:
+      # Map host port 8003 to the container's internal port 8000.
+      - "8003:8000"
+
+  # -- The Order Application Service (Coordinator) --
+  order_service:
+    build: ./order_service
+    depends_on: [order-database, inventory_service, payment_service] # Depends on its DB and the other services.
+    environment:
+      # Connection URL for its own database.
+      DATABASE_URL: postgresql://user:pass@order-database:5432/order_database
+      # URLs for communicating with other services within the Docker network.
+      INVENTORY_URL: http://inventory_service:8000
+      PAYMENT_URL: http://payment_service:8000
+    ports:
+      # Map host port 8001 to the container's internal port 8000. This is the main entry point.
+      - "8001:8000"
