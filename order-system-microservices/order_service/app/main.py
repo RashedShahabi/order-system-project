@@ -1,154 +1,111 @@
-# In file: order-system-microservices/order_service/app/main.py
+# File: order_service/app/main.py
 
 import uuid
-# ---------------------------------
-
-from fastapi import FastAPI
+import json
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-import requests
 
-from .database import SessionLocal, engine
-from .models import Base, Order
+# --- Internal Imports ---
+from .database import engine, SessionLocal, Base
+from .models import Order
+# Import the RabbitMQ producer we just created
+from .messaging.bus import RabbitMQProducer
 
-# Create database tables on startup if they don't exist.
+# --- Database Initialization ---
 Base.metadata.create_all(bind=engine)
 
+# --- App Instance ---
 app = FastAPI()
 
-# Service URLs for inter-service communication.
-INVENTORY_URL = "http://inventory_service:8000/api/v1/stock"
-PAYMENT_URL = "http://payment_service:8000/api/v1/payments"
+# --- RabbitMQ Setup ---
+# Initialize the producer to send events
+event_producer = RabbitMQProducer()
 
-
+# --- Pydantic Models ---
 class OrderRequest(BaseModel):
     """Defines the data model for an incoming order request."""
     item_sku: str
     quantity: int
     amount: float
     idempotency_key: str
-# -------------------------------------------------------------
+    currency: str = "USD"
+
+# --- Dependencies ---
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- Endpoints ---
 
 @app.get("/")
 def root():
-    """Health check endpoint."""
-    return {"message": "Order service is running"}
+    return {"message": "Order Service is running (Event-Driven Mode)"}
 
-# Creates a new order by orchestrating calls to Inventory and Payment services.
 @app.post("/api/v1/orders")
-def create_order(req: OrderRequest):
-    database: Session = SessionLocal()
-
-    # 1. Idempotency Check: Ensure this request hasn't been processed before.
-    existing_order = database.query(Order).filter(Order.idempotency_key == req.idempotency_key).first()
+def create_order(req: OrderRequest, db: Session = Depends(get_db)):
+    """
+    Creates an order asynchronously.
+    1. Checks idempotency.
+    2. Saves order as 'PENDING'.
+    3. Publishes 'order.created' event to RabbitMQ.
+    """
+    
+    # 1. Idempotency Check
+    existing_order = db.query(Order).filter(Order.idempotency_key == req.idempotency_key).first()
     if existing_order:
-        database.close()
         return {
-            "status": existing_order.status,
-            "order_id": existing_order.order_id
+            "message": "Order already received (Idempotent)",
+            "order_id": existing_order.order_id,
+            "status": existing_order.status
         }
 
-    # --- CHANGE 3: GENERATE A NEW, UNIQUE ORDER ID ---
+    # Generate a unique Order ID
     new_order_id = str(uuid.uuid4())
-    # --------------------------------------------------
 
-    # 2. Reserve stock by calling the Inventory Service.
-    try:
-        reserve_response = requests.post(
-            f"{INVENTORY_URL}/reserve",
-            json={"item_sku": req.item_sku, "quantity": req.quantity}
-        )
-        reserve_response.raise_for_status() # Raises an exception for 4xx/5xx status codes
-        if "error" in reserve_response.json():
-            raise requests.exceptions.RequestException("Stock reservation failed")
-    except requests.exceptions.RequestException:
-        database.close()
-        return {"status": "failed", "error": "Inventory service communication error or reservation failed"}
-
-
-    # 3. Authorize payment by calling the Payment Service.
-    try:
-        payment_response = requests.post(
-            f"{PAYMENT_URL}/authorize",
-            # --- CHANGE 4: USE THE NEWLY GENERATED ID ---
-            json={"order_id": new_order_id, "amount": req.amount}
-            # --------------------------------------------
-        )
-        payment_response.raise_for_status()
-        payment_data = payment_response.json()
-    except requests.exceptions.RequestException:
-        # Compensating action: Release stock if payment service is unreachable.
-        requests.post(f"{INVENTORY_URL}/release", json={"item_sku": req.item_sku, "quantity": req.quantity})
-        database.close()
-        return {"status": "failed", "error": "Payment service communication error"}
-
-    authorized = payment_data.get("authorized", False)
-
-    if not authorized:
-        # Compensating action: Release stock if payment is declined.
-        requests.post(
-            f"{INVENTORY_URL}/release",
-            json={"item_sku": req.item_sku, "quantity": req.quantity}
-        )
-
-        # Save the order as 'failed'.
-        status = "failed"
-    else:
-        # 4. Success: The order is confirmed.
-        status = "confirmed"
-
-    # Save the final order state to the database.
+    # 2. Save Order to Database with status 'PENDING'
+    # We don't know the result yet, so we wait for events.
     new_order = Order(
-        # --- CHANGE 5: USE THE NEWLY GENERATED ID ---
         order_id=new_order_id,
-        # --------------------------------------------
         item_sku=req.item_sku,
         quantity=req.quantity,
         amount=req.amount,
-        status=status,
+        status="PENDING",  # Initial status for Saga
         idempotency_key=req.idempotency_key
     )
-    database.add(new_order)
-    database.commit()
-    database.close()
+    db.add(new_order)
+    db.commit()
+    db.refresh(new_order)
 
-    # --- CHANGE 6: RETURN THE NEWLY GENERATED ID ---
-    return {"status": status, "order_id": new_order_id}
-    # ---------------------------------------------
-
-# Retrieves a single order by its ID.
-@app.get("/api/v1/orders/{order_id}")
-def get_order(order_id: str):
-    database: Session = SessionLocal()
-    order = database.query(Order).filter(Order.order_id == order_id).first()
-    database.close()
-
-    if not order:
-        return {"error": "Order not found"}
+    # 3. Publish Event to RabbitMQ
+    event_payload = {
+        "order_id": new_order_id,
+        "item_sku": req.item_sku,
+        "quantity": req.quantity,
+        "amount": req.amount,
+        "currency": req.currency
+    }
+    
+    # Routing key 'order.created' tells other services a new order exists
+    event_producer.publish(routing_key="order.created", message=event_payload)
 
     return {
-        "order_id": order.order_id,
-        "item_sku": order.item_sku,
-        "quantity": order.quantity,
-        "amount": order.amount,
-        "status": order.status
+        "status": "PENDING",
+        "order_id": new_order_id,
+        "message": "Order created and event published. Processing continues in background."
     }
 
-# Retrieves a list of all orders.
 @app.get("/api/v1/orders")
-def list_orders():
-    database: Session = SessionLocal()
-    orders = database.query(Order).all()
-    database.close()
+def list_orders(db: Session = Depends(get_db)):
+    orders = db.query(Order).all()
+    return orders
 
-    # Format the list of orders for the response.
-    return [
-        {
-            "order_id": o.order_id,
-            "item_sku": o.item_sku,
-            "quantity": o.quantity,
-            "amount": o.amount,
-            "status": o.status
-        }
-        for o in orders
-    ]
+@app.get("/api/v1/orders/{order_id}")
+def get_order(order_id: str, db: Session = Depends(get_db)):
+    order = db.query(Order).filter(Order.order_id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
