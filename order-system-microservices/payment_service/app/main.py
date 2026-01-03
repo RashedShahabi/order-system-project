@@ -1,56 +1,53 @@
-# File: payment_service/app/main.py
-
-# --- Imports ---
-from fastapi import FastAPI, Depends
-from pydantic import BaseModel
+import uuid
+from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
-
-# --- Internal Imports ---
-from .database import engine, Base, get_db
+from .database import engine, Base, SessionLocal
 from .models import Payment
-# Import the helper to start consumer
 from .consumers import start_consumer_thread
 
-# --- Database Initialization ---
+# 1. ساخت جدول‌ها
 Base.metadata.create_all(bind=engine)
 
-# --- App Instance ---
 app = FastAPI()
 
-# --- Startup Event (New for Phase 2) ---
+# 2. روشن کردن Consumer موقع بالا آمدن برنامه
 @app.on_event("startup")
 def startup_event():
-    """Start the RabbitMQ consumer when the app starts."""
     start_consumer_thread()
 
-# --- Request Models ---
-class PaymentRequest(BaseModel):
-    order_id: str
-    amount: float
-    currency: str = "USD"
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-# --- Endpoints ---
 @app.get("/")
 def root():
-    return {"message": "Payment Service is running (Event-Driven Mode)"}
+    return {"message": "Payment Service is running"}
 
-# Note: The HTTP endpoint below is technically not used in the automated RabbitMQ flow,
-# but we keep it for manual testing or debugging if needed.
-@app.post("/api/v1/payments/authorize")
-def authorize_payment_manual(req: PaymentRequest, db: Session = Depends(get_db)):
-    """Manual trigger for payment (HTTP)."""
-    is_auth = req.amount < 1000
-    status = "success" if is_auth else "failed"
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
 
-    new_payment = Payment(
-        order_id=req.order_id,
-        amount=req.amount,
-        currency=req.currency,
-        status=status,
-        is_successful=is_auth
-    )
-    db.add(new_payment)
-    db.commit()
-    db.refresh(new_payment)
+# 3. این همان تابعی است که جا مانده بود!
+@app.get("/api/v1/payments/{payment_id}")
+def get_payment(payment_id: str, db: Session = Depends(get_db)):
+    # الف) اول سعی کن با شناسه سفارش (UUID) پیدا کنی
+    # (چون ممکن است تست با UUID درخواست بدهد)
+    payment = db.query(Payment).filter(Payment.order_id == payment_id).first()
 
-    return {"authorized": is_auth, "payment_id": new_payment.id}
+    # ب) اگر پیدا نشد و ورودی عدد بود (مثل 4)، با ID اصلی دیتابیس بگرد
+    if not payment and payment_id.isdigit():
+        payment = db.query(Payment).filter(Payment.id == int(payment_id)).first()
+    
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    return {
+        "id": payment.id,
+        "order_id": payment.order_id,
+        "amount": payment.amount,
+        "status": payment.status,
+        "is_successful": payment.is_successful
+    }

@@ -1,16 +1,21 @@
-from sqlalchemy import Column, Integer, String, Float
-from .database import Base # Import the Base class from our database setup
+# File: order_service/app/models.py
 
-# Defines the ORM model for an 'Order' stored in the database.
+from sqlalchemy import Column, Integer, String, Float, DateTime
+from sqlalchemy.sql import func
+from .database import Base
+
 class Order(Base):
-    # The name of the database table.
     __tablename__ = "orders"
 
-    # Define the table columns.
-    id = Column(Integer, primary_key=True, index=True) # Auto-incrementing primary key.
-    order_id = Column(String, unique=True) # Business-level order identifier.
-    item_sku = Column(String) # SKU of the item being ordered.
-    quantity = Column(Integer) # Quantity of the item ordered.
-    amount = Column(Float) # Total amount for the order.
-    status = Column(String) # Order status (e.g., "confirmed", "failed").
-    idempotency_key = Column(String, unique=True) # Key to prevent duplicate processing.
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(String, unique=True, index=True)
+    item_sku = Column(String, index=True)
+    quantity = Column(Integer)
+    amount = Column(Float)
+    currency = Column(String, default="USD")
+    status = Column(String, default="PENDING")
+    
+    # --- FIX IS HERE: Added this missing column ---
+    idempotency_key = Column(String, unique=True, index=True, nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

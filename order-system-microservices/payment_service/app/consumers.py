@@ -1,105 +1,101 @@
 import json
 import pika
-import os
-import time
 import threading
+import time
 from sqlalchemy.orm import Session
 from .database import SessionLocal
 from .models import Payment
-from .messaging.bus import RabbitMQProducer
 
 class PaymentConsumer:
     def __init__(self):
-        self.producer = RabbitMQProducer()
-        self.host = os.getenv("RABBITMQ_HOST", "rabbitmq")
-        self.connection = None
-        self.channel = None
-
-    def connect(self):
-        """Connects to RabbitMQ."""
         while True:
             try:
-                credentials = pika.PlainCredentials('guest', 'guest')
-                parameters = pika.ConnectionParameters(self.host, credentials=credentials)
-                self.connection = pika.BlockingConnection(parameters)
+                self.connection = pika.BlockingConnection(
+                    pika.ConnectionParameters(host='rabbitmq', heartbeat=600, blocked_connection_timeout=300))
                 self.channel = self.connection.channel()
-                
-                # Declare exchange
                 self.channel.exchange_declare(exchange='events', exchange_type='topic', durable=True)
-
-                # --- Queue: Handle Stock Reserved ---
-                # We only care if stock is successfully reserved.
-                self.channel.queue_declare(queue='payment.stock.reserved', durable=True)
-                self.channel.queue_bind(
-                    exchange='events', queue='payment.stock.reserved', routing_key='stock.reserved'
-                )
-
-                print("Payment Consumer connected to RabbitMQ!")
+                
+                result = self.channel.queue_declare(queue='', exclusive=True)
+                queue_name = result.method.queue
+                
+                # گوش دادن به رزرو موفق (عادی)
+                self.channel.queue_bind(exchange='events', queue=queue_name, routing_key='stock.reserved')
+                
+                # --- تغییر مهم: گوش دادن به شکست موجودی (برای هماهنگی ID ها) ---
+                self.channel.queue_bind(exchange='events', queue=queue_name, routing_key='stock.rejected')
+                
+                self.channel.basic_consume(queue=queue_name, on_message_callback=self.callback, auto_ack=True)
+                print(" [*] Payment Service listening...")
+                self.channel.start_consuming()
                 break
-            except pika.exceptions.AMQPConnectionError:
-                print("RabbitMQ not ready, retrying in 5 seconds...")
+            except Exception as e:
                 time.sleep(5)
 
-    def process_stock_reserved(self, ch, method, properties, body):
-        """
-        Received 'stock.reserved'.
-        Action: Process Payment -> Publish Success/Failure.
-        """
-        data = json.loads(body)
-        print(f" [x] Processing Payment for Order: {data}")
-        
+    def callback(self, ch, method, properties, body):
         db = SessionLocal()
         try:
-            amount = data.get('amount', 0)
-            order_id = data.get('order_id')
+            event = json.loads(body)
+            print(f" [x] Payment Processing: {method.routing_key} -> {event}")
             
-            # --- Business Logic ---
-            # If amount < 1000 => Success
-            # If amount >= 1000 => Fail
-            is_successful = amount < 1000
-            status = "success" if is_successful else "failed"
+            order_id = event.get("order_id")
             
-            # 1. Save to Database
+            # --- سناریوی ۲: اگر انبار رد کرد، یک رکورد خالی بساز تا ID هماهنگ بماند ---
+            if method.routing_key == 'stock.rejected':
+                dummy_payment = Payment(
+                    order_id=order_id,
+                    amount=0,
+                    currency="USD",
+                    status="FAILED",
+                    is_successful=False
+                )
+                db.add(dummy_payment)
+                db.commit()
+                print(f"Dummy payment created for {order_id} to sync IDs.")
+                return 
+            # -------------------------------------------------------------------
+
+            # --- سناریوی ۱ و ۳: پردازش عادی ---
+            amount = event.get("amount", 0)
+            item_sku = event.get("item_sku")
+            quantity = event.get("quantity")
+            
+            if amount > 200:
+                routing_key = "payment.failed"
+                db_status = "FAILED"
+                is_success = False
+            else:
+                routing_key = "payment.succeeded"
+                db_status = "SUCCESS"
+                is_success = True
+
             new_payment = Payment(
                 order_id=order_id,
                 amount=amount,
-                currency=data.get('currency', 'USD'),
-                status=status,
-                is_successful=is_successful
+                currency="USD",
+                status=db_status,
+                is_successful=is_success
             )
             db.add(new_payment)
             db.commit()
-            print(f"Payment {status} for Order {order_id} saved to DB.")
+            print(f"Payment saved: {db_status}")
 
-            # 2. Publish Event
-            if is_successful:
-                routing_key = "payment.succeeded"
-            else:
-                routing_key = "payment.failed"
+            payload = {
+                "order_id": order_id, 
+                "status": routing_key,
+                "item_sku": item_sku,
+                "quantity": quantity
+            }
             
-            # Send the event back to RabbitMQ so Order Service (and Inventory) can know
-            self.producer.publish(routing_key=routing_key, message=data)
-
+            self.channel.basic_publish(
+                exchange='events',
+                routing_key=routing_key,
+                body=json.dumps(payload)
+            )
         except Exception as e:
-            print(f"Error processing payment: {e}")
+            print(f"Error: {e}")
         finally:
             db.close()
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-
-    def start_listening(self):
-        """Starts the consuming loop."""
-        if not self.connection:
-            self.connect()
-
-        self.channel.basic_consume(
-            queue='payment.stock.reserved', on_message_callback=self.process_stock_reserved
-        )
-
-        print(" [*] Payment Service waiting for events...")
-        self.channel.start_consuming()
 
 def start_consumer_thread():
-    """Helper to run consumer in a background thread."""
-    consumer = PaymentConsumer()
-    thread = threading.Thread(target=consumer.start_listening, daemon=True)
-    thread.start()
+    t = threading.Thread(target=PaymentConsumer, daemon=True)
+    t.start()
