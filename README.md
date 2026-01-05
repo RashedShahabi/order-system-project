@@ -78,19 +78,3 @@ Once running, you can access the interactive API docs at:
 **Scenario 4: Idempotency**
 1.  Send the same request from Scenario 1 again with the same `idempotency_key` ("key-1").
 2.  Result: Returns the **existing** order details. No new order created, stock is not reduced again.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
